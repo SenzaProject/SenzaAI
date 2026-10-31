@@ -15,11 +15,13 @@ class UiPrefs(ctx: Context) {
     var reducedEffects by mutableStateOf(prefs.getBoolean("reduced", false))
         private set
 
+    @JvmName("applyThemeMode")
     fun setThemeMode(v: Int) {
         themeMode = v
         prefs.edit().putInt("theme", v).apply()
     }
 
+    @JvmName("applyReducedEffects")
     fun setReducedEffects(v: Boolean) {
         reducedEffects = v
         prefs.edit().putBoolean("reduced", v).apply()
