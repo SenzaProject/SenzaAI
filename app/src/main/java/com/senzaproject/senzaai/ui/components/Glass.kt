@@ -51,6 +51,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
@@ -118,7 +119,7 @@ fun GlassBackground(content: @Composable BoxScope.() -> Unit) {
 
 // ------------------------------------------------------------------ Util
 
-fun Modifier.clickableNoRipple(onClick: () -> Unit): Modifier = androidx.compose.ui.composed {
+fun Modifier.clickableNoRipple(onClick: () -> Unit): Modifier = composed {
     clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onClick)
 }
 

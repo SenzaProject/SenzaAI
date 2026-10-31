@@ -3,6 +3,7 @@ package com.senzaproject.senzaai.ui.screens
 import android.os.Build
 import androidx.compose.foundation.layout.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.senzaproject.senzaai.BuildConfig
 import com.senzaproject.senzaai.ai.AiProvider

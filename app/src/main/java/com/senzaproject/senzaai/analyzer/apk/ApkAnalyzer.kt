@@ -211,6 +211,16 @@ class ApkAnalyzer(private val ctx: Context) {
 
         val compat = compatibility(ai, libs, pi.packageName)
 
+        // Salin variabel yang diubah di dalam lambda ke val agar tipenya pasti.
+        val resFilesF: Int = resFiles
+        val arscF: Long = arsc
+        val assetsF: Int = assets
+        val v1F: Boolean = v1
+        val structureF: List<Triple<String, Long, Int>> =
+            groups.entries.sortedByDescending { it.value.first }.map { Triple(it.key, it.value.first, it.value.second) }
+        val notesF: List<ApkNote> = notes.toList()
+        val compatF: List<CompatFinding> = compat.toList()
+
         return ApkReport(
             fileName = displayName,
             sizeBytes = file.length(),
@@ -228,13 +238,13 @@ class ApkAnalyzer(private val ctx: Context) {
             components = components,
             permissions = perms,
             certs = certs,
-            hasV1Signature = v1,
-            resourceFiles = resFiles,
-            arscBytes = arsc,
-            assetFiles = assets,
-            structure = groups.entries.sortedByDescending { it.value.first }.map { Triple(it.key, it.value.first, it.value.second) },
-            notes = notes,
-            compat = compat
+            hasV1Signature = v1F,
+            resourceFiles = resFilesF,
+            arscBytes = arscF,
+            assetFiles = assetsF,
+            structure = structureF,
+            notes = notesF,
+            compat = compatF
         )
     }
 
