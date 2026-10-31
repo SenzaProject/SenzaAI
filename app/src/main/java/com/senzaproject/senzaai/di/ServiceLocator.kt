@@ -22,6 +22,7 @@ class ServiceLocator(val app: Application) {
     val operationLog by lazy { OperationLog(app) }
     val device by lazy { DeviceRepository(app) }
     val access by lazy { AccessManager(app, operationLog) }
+    val editor by lazy { com.senzaproject.senzaai.platform.root.RootEditor(app, access, operationLog) }
     val secure by lazy { SecureStore(app) }
     val aiSettings by lazy { AiSettingsStore(app, secure) }
     val aiClient by lazy { AiClient() }

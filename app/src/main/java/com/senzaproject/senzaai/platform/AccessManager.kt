@@ -123,4 +123,25 @@ class AccessManager(private val ctx: Context, private val log: OperationLog) {
         log.add(if (useRoot) "ROOT" else "NORMAL", "perintah pengguna: $command", if (r.ok) "ok" else "exit=${r.exitCode}")
         r
     }
+
+    /**
+     * Perintah root yang disusun aplikasi sendiri (bukan teks bebas/AI) untuk fitur Editor File Root.
+     * Path sudah divalidasi PathGuard oleh pemanggil. Dicatat di log.
+     */
+    suspend fun runRootEdit(command: String, label: String, timeoutMs: Long = 30_000): ShellResult = withContext(Dispatchers.IO) {
+        if (!rootVerified) return@withContext ShellResult(-1, "Akses root belum diverifikasi.")
+        val r = Sys.execute(listOf("su", "-c", command), timeoutMs)
+        log.add("ROOT", "$label: ${command.take(200)}", if (r.ok) "ok" else "exit=${r.exitCode}")
+        r
+    }
+
+    /** Cek file mana yang ada (untuk pintasan Edit cepat). Satu eksekusi, satu entri log. */
+    suspend fun existingFiles(paths: List<String>, asRoot: Boolean): List<String> = withContext(Dispatchers.IO) {
+        val valid = paths.map { com.senzaproject.senzaai.platform.root.PathGuard.validate(it) }
+        val cmd = "for f in " + valid.joinToString(" ") { "'$it'" } + "; do [ -f \"\$f\" ] && echo \"\$f\"; done"
+        val useRoot = asRoot && rootVerified
+        val r = if (useRoot) Sys.execute(listOf("su", "-c", cmd), 15_000) else Sys.execute(listOf("sh", "-c", cmd), 15_000)
+        log.add(if (useRoot) "ROOT" else "NORMAL", "pindai pintasan edit (${valid.size} path)", if (r.ok || r.output.isNotBlank()) "ok" else "exit=${r.exitCode}")
+        r.output.lines().map { it.trim() }.filter { it in valid }
+    }
 }

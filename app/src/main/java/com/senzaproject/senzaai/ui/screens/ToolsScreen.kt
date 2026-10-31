@@ -18,6 +18,8 @@ import com.senzaproject.senzaai.di.ServiceLocator
 import com.senzaproject.senzaai.domain.model.AccessMode
 import com.senzaproject.senzaai.monitor.PerfSample
 import com.senzaproject.senzaai.monitor.ProcInfo
+import com.senzaproject.senzaai.platform.root.RootEditor
+import com.senzaproject.senzaai.platform.root.RootEditor.ApplyMode
 import com.senzaproject.senzaai.platform.root.SafeAction
 import com.senzaproject.senzaai.ui.components.*
 import com.senzaproject.senzaai.ui.theme.LocalGlass
@@ -100,11 +102,17 @@ private fun AccessTab(s: ServiceLocator) {
     }
     GlassCard {
         Heading("Prinsip keamanan")
-        Body("• Read-only secara default\n• Tidak ada operasi root tersembunyi atau diam-diam\n• AI tidak pernah menjalankan perintah\n• Perintah berbahaya (format, tulis ke partisi, hapus sistem) diblokir\n• Seluruh operasi sensitif dicatat", dim = true)
+        Body("• Read-only secara default; edit file hanya lewat Editor File Root (simpan dulu, terapkan manual, backup otomatis)\n• Tidak ada operasi root tersembunyi atau diam-diam\n• AI tidak pernah menjalankan perintah\n• Perintah berbahaya (format, tulis ke partisi, hapus sistem) diblokir\n• Seluruh operasi sensitif dicatat", dim = true)
     }
 }
 
 // ============================================================================ File Root
+
+private val QUICK_FILES = listOf(
+    "/system/build.prop", "/system_ext/build.prop", "/vendor/build.prop", "/product/build.prop", "/odm/build.prop",
+    "/system/etc/permissions/platform.xml", "/vendor/etc/media_codecs.xml", "/vendor/etc/media_codecs_performance.xml",
+    "/vendor/etc/audio_policy_configuration.xml", "/system/etc/init/hw/init.rc"
+)
 
 private data class FileEntry(val name: String, val isDir: Boolean, val isLink: Boolean, val perm: String, val owner: String, val size: String)
 
@@ -131,6 +139,19 @@ private fun FilesTab(s: ServiceLocator) {
     var pattern by remember { mutableStateOf("") }
     var found by remember { mutableStateOf<List<String>?>(null) }
     val rootOk = s.access.isRootVerified
+    val editor = s.editor
+    val pending by editor.pending.collectAsState()
+    var contentIsFile by remember { mutableStateOf(false) }
+    var editing by remember { mutableStateOf<String?>(null) }
+    var editText by remember { mutableStateOf("") }
+    var editOrig by remember { mutableStateOf("") }
+    var confirmApply by remember { mutableStateOf(false) }
+    var applyMsg by remember { mutableStateOf<String?>(null) }
+    var modeIdx by remember { mutableStateOf(0) }
+    var quickFound by remember { mutableStateOf<List<String>?>(null) }
+    var overlays by remember { mutableStateOf<List<String>?>(null) }
+    val modeNames = listOf("Otomatis", "Langsung", "Overlay Magisk")
+    val modes = listOf(ApplyMode.AUTO, ApplyMode.DIRECT, ApplyMode.OVERLAY)
 
     fun open(p: String) {
         scope.launch {
@@ -156,6 +177,7 @@ private fun FilesTab(s: ServiceLocator) {
             try {
                 val a = SafeAction.ReadFile(p)
                 val r = s.access.run(a, asRoot)
+                contentIsFile = true
                 content = if (r.output.contains('\u0000')) a.path to "(file biner; tidak ditampilkan)"
                 else a.path to r.output.take(60_000).ifEmpty { if (r.ok) "(kosong)" else "Tidak dapat dibaca (izin ditolak?)" }
             } catch (e: IllegalArgumentException) {
@@ -165,11 +187,27 @@ private fun FilesTab(s: ServiceLocator) {
         }
     }
 
+    fun startEdit(p: String) {
+        scope.launch {
+            busy = true; error = null; applyMsg = null
+            val staged = editor.pendingFor(p)
+            val r = editor.read(p, asRoot)
+            r.onSuccess { orig ->
+                editing = p
+                editOrig = orig
+                editText = staged ?: orig
+                content = null
+            }.onFailure { error = it.message ?: "Gagal membuka file untuk diedit." }
+            busy = false
+        }
+    }
+
     fun info(p: String) {
         scope.launch {
             busy = true; error = null
             try {
                 val a = SafeAction.Stat(p)
+                contentIsFile = false
                 content = a.path to s.access.run(a, asRoot).output.take(4000)
             } catch (e: IllegalArgumentException) {
                 error = e.message
@@ -180,7 +218,7 @@ private fun FilesTab(s: ServiceLocator) {
 
     GlassCard {
         Heading("Root File Explorer")
-        Body("Menjelajah, membaca teks, mencari, dan melihat info/izin file. Hanya baca: tidak ada operasi ubah atau hapus.", dim = true)
+        Body("Menjelajah, membaca, mencari, dan melihat info file. File teks (build.prop, XML, rc, dll.) bisa diedit dengan root: Edit → Simpan perubahan → Terapkan perubahan (perangkat restart).", dim = true)
         GlassTextField(path, { path = it }, "Path absolut", mono = true)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             Chip(if (asRoot && rootOk) "Mode: Root" else "Mode: Normal", asRoot && rootOk) { if (rootOk) asRoot = !asRoot }
@@ -207,14 +245,133 @@ private fun FilesTab(s: ServiceLocator) {
             }, enabled = !busy && pattern.isNotBlank())
         }
     }
+    GlassCard {
+        Heading("Edit cepat")
+        Body("Pintasan build.prop, XML, dan init.rc umum. Tekan Pindai untuk melihat file yang ada di perangkat ini.", dim = true)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GlassButton("Pindai file", {
+                scope.launch {
+                    busy = true
+                    quickFound = s.access.existingFiles(QUICK_FILES, asRoot)
+                    busy = false
+                }
+            }, Modifier.weight(1f), primary = true, enabled = !busy)
+            GlassButton("Folder etc", { open("/system/etc") }, Modifier.weight(1f), enabled = !busy)
+        }
+        quickFound?.let { list ->
+            if (list.isEmpty()) Body("Tidak ada file pintasan yang ditemukan / terbaca.", dim = true)
+            list.forEach { p ->
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Mono(p, Modifier.weight(1f), 11)
+                    GlassButton("Edit", { startEdit(p) }, enabled = !busy)
+                }
+            }
+        }
+        Caption("File lain: cari namanya di kolom Cari, buka file, lalu tekan Edit file ini.")
+    }
+
     if (busy) Spinner("Memproses…")
     error?.let { ErrorCard(it) }
+
+    if (confirmApply) ConfirmDialog(
+        title = "Terapkan perubahan & restart?",
+        message = "${pending.size} file akan diterapkan dengan mode ${modeNames[modeIdx]} (backup otomatis disimpan di aplikasi), lalu perangkat RESTART SENDIRI.\n\n" + pending.joinToString("\n") { "• ${it.path}" } +
+            "\n\nKesalahan di file sistem (mis. build.prop atau XML) bisa menyebabkan bootloop. Pastikan kamu punya cara pemulihan (recovery/backup). Simpan pekerjaan di aplikasi lain dulu.",
+        confirmText = "Terapkan & restart",
+        danger = true,
+        onConfirm = {
+            confirmApply = false
+            scope.launch {
+                busy = true
+                val r = editor.apply(modes[modeIdx])
+                applyMsg = buildString {
+                    if (r.rebooting) append("Berhasil${if (r.overlaid.isNotEmpty()) " (${r.overlaid.size} file via overlay Magisk)" else ""}. Perangkat akan restart…")
+                    else {
+                        if (r.applied.isNotEmpty()) append("Berhasil ditulis: ${r.applied.size} file. ")
+                        append("Tidak ada restart karena ada yang gagal:\n")
+                        r.failed.forEach { append("• ${it.first}: ${it.second}\n") }
+                    }
+                }
+                busy = false
+            }
+        },
+        onDismiss = { confirmApply = false }
+    )
+
+    editing?.let { ep ->
+        GlassCard(strong = true) {
+            Heading("Edit file")
+            Mono(ep, size = 11)
+            GlassTextField(editText, { editText = it }, "Isi file", singleLine = false, mono = true, minLines = 12)
+            Caption("Perubahan baru disimpan di aplikasi. File sistem tidak disentuh sampai kamu menekan Terapkan perubahan.")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                GlassButton("Simpan perubahan", {
+                    try {
+                        editor.stage(ep, editText)
+                        editing = null
+                        applyMsg = null
+                    } catch (e: IllegalArgumentException) {
+                        error = e.message
+                    }
+                }, Modifier.weight(1f), primary = true, enabled = editText != editOrig)
+                GlassButton("Batal", { editing = null }, Modifier.weight(1f))
+            }
+        }
+    }
+
+    if (pending.isNotEmpty() || applyMsg != null) GlassCard(strong = true) {
+        Heading("Perubahan tertunda (${pending.size})")
+        Body("Sudah disimpan di aplikasi, belum berlaku. Berlaku setelah perangkat restart.", dim = true)
+        pending.forEach { p ->
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Mono(p.path, Modifier.weight(1f), 11)
+                GlassButton("Edit", { startEdit(p.path) }, enabled = !busy)
+                GlassButton("Buang", { editor.discard(p.path) }, danger = true, enabled = !busy)
+            }
+        }
+        if (pending.isNotEmpty()) {
+            Caption("Mode terapkan")
+            ChipRow(modeNames, modeIdx) { modeIdx = it }
+            Caption(when (modeIdx) {
+                0 -> "Otomatis: tulis langsung; bila partisi erofs/hanya-baca, otomatis pakai overlay Magisk."
+                1 -> "Langsung: tulis ke partisi asli (remount rw). Gagal di partisi erofs."
+                else -> "Overlay: partisi asli tidak disentuh. File ditaruh di module systemless (/data/adb/modules/senza_edit), butuh Magisk/KernelSU/APatch."
+            })
+            GlassButton("Terapkan perubahan (restart)", { confirmApply = true }, Modifier.fillMaxWidth(), primary = true, danger = true, enabled = rootOk && !busy)
+            if (!rootOk) Caption("Verifikasi root dulu di tab Akses.")
+        }
+        applyMsg?.let { Body(it) }
+    }
+
+    if (rootOk) ExpandableCard("Overlay Magisk (hasil edit)", false, trailing = overlays?.size?.toString()) {
+        Caption("File yang saat ini di-overlay oleh Senza AI. Menghapus overlay mengembalikan file asli setelah restart.")
+        GlassButton("Muat daftar overlay", { scope.launch { overlays = editor.overlays() } }, enabled = !busy)
+        overlays?.let { list ->
+            if (list.isEmpty()) Body("Belum ada overlay.", dim = true)
+            list.forEach { p ->
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Mono(p, Modifier.weight(1f), 11)
+                    GlassButton("Hapus", {
+                        scope.launch {
+                            val ok = editor.removeOverlay(p)
+                            if (!ok) error = "Gagal menghapus overlay."
+                            overlays = editor.overlays()
+                        }
+                    }, danger = true, enabled = !busy)
+                }
+            }
+        }
+        Caption("Jika terjadi bootloop setelah overlay: nonaktifkan/hapus module \"Senza AI Edit Overlay\" lewat recovery atau mode aman Magisk.")
+    }
 
     content?.let { (title, body) ->
         GlassCard(strong = true) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Mono(title, Modifier.weight(1f), 11)
                 GlassButton("Tutup", { content = null })
+            }
+            if (contentIsFile && rootOk && RootEditor.isEditable(title)) {
+                GlassButton("Edit file ini", { startEdit(title) }, enabled = !busy)
             }
             SelectionContainer { Mono(body, size = 11) }
             if (body.length >= 60_000) Caption("Ditampilkan sebagian.")

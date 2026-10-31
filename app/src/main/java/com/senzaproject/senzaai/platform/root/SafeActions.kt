@@ -30,6 +30,16 @@ sealed class SafeAction(val title: String, val description: String) {
         override val command: String get() = "head -c 262144 -- '$path'"
     }
 
+    class SizeOf(path: String) : SafeAction("Ukuran file", "Membaca ukuran file dalam byte (read-only).") {
+        val path: String = PathGuard.validate(path)
+        override val command: String get() = "wc -c < '$path'"
+    }
+
+    class ReadFileFull(path: String) : SafeAction("Baca file penuh", "Membaca isi penuh file teks untuk diedit (read-only).") {
+        val path: String = PathGuard.validate(path)
+        override val command: String get() = "cat -- '$path'"
+    }
+
     class ListDir(path: String) : SafeAction("Daftar direktori", "Menampilkan isi direktori beserta izin (read-only).") {
         val path: String = PathGuard.validate(path, allowDevListing = true)
         override val command: String get() = "ls -la -- '$path'"
