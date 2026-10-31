@@ -1,0 +1,593 @@
+package com.senzaproject.senzaai.ui.screens
+
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import com.senzaproject.senzaai.di.ServiceLocator
+import com.senzaproject.senzaai.domain.model.AccessMode
+import com.senzaproject.senzaai.monitor.PerfSample
+import com.senzaproject.senzaai.monitor.ProcInfo
+import com.senzaproject.senzaai.platform.root.SafeAction
+import com.senzaproject.senzaai.ui.components.*
+import com.senzaproject.senzaai.ui.theme.LocalGlass
+import com.senzaproject.senzaai.utils.Sys
+import com.senzaproject.senzaai.utils.f1
+import com.senzaproject.senzaai.utils.formatBytes
+import com.senzaproject.senzaai.utils.formatDuration
+import com.senzaproject.senzaai.utils.formatTime
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+private val TABS = listOf("Akses", "File Root", "Shell & ADB", "Monitor", "Log")
+
+@Composable
+fun ToolsScreen(s: ServiceLocator) {
+    var tab by rememberSaveable { mutableStateOf(0) }
+    ScreenScaffold("Tools", "Akses, penjelajah file, shell, ADB, monitor performa") {
+        ChipRow(TABS, tab) { tab = it }
+        when (tab) {
+            0 -> AccessTab(s)
+            1 -> FilesTab(s)
+            2 -> ShellTab(s)
+            3 -> MonitorTab(s)
+            else -> LogTab(s)
+        }
+    }
+}
+
+// ============================================================================ Akses
+
+@Composable
+private fun AccessTab(s: ServiceLocator) {
+    val g = LocalGlass.current
+    val st by s.access.state.collectAsState()
+    val scope = rememberCoroutineScope()
+    var confirm by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
+    var msg by remember { mutableStateOf<String?>(null) }
+
+    if (confirm) ConfirmDialog(
+        title = "Verifikasi akses root",
+        message = "Senza AI akan meminta izin root satu kali (menjalankan \"su -c id\") untuk memastikan akses. Root manager akan menampilkan permintaan persetujuan.\n\nSetelah aktif, Senza AI hanya menjalankan aksi baca-saja yang sudah ditentukan, atau perintah yang kamu ketik dan konfirmasi sendiri. Semua tercatat di Log.",
+        confirmText = "Minta izin root",
+        onConfirm = {
+            confirm = false
+            scope.launch {
+                busy = true
+                val r = s.access.verifyRoot()
+                msg = if (s.access.isRootVerified) "Akses root terverifikasi (uid=0)." else "Root tidak tersedia atau ditolak. ${r.output.take(120)}"
+                busy = false
+            }
+        },
+        onDismiss = { confirm = false }
+    )
+
+    GlassCard(strong = true) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Heading("Senza Access Manager")
+            StatusPill(st.active.label, if (st.active == AccessMode.ROOT) g.warn else g.good)
+        }
+        Body("Tiga tingkat akses diperlakukan berbeda: Normal (API standar), ADB/Shizuku, dan Root.", dim = true)
+    }
+
+    ExpandableCard("Lingkungan root", true) {
+        st.root.details.forEach { Body("• $it") }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GlassButton(if (busy) "Memeriksa…" else "Verifikasi root", { confirm = true }, primary = true, enabled = !busy && !st.root.verified)
+            if (st.root.verified) GlassButton("Akhiri sesi root", { s.access.revokeRootSession() }, danger = true)
+            GlassButton("Deteksi ulang", { s.access.refresh() })
+        }
+        msg?.let { Caption(it) }
+    }
+    ExpandableCard("Kemampuan mode aktif", true) { st.capabilities.forEach { Body("✓ $it") } }
+    ExpandableCard("Batasan", true) { st.limits.forEach { Body("• $it", dim = true) } }
+    GlassCard {
+        Heading("ADB / Shizuku")
+        KeyValue("Shizuku", if (st.shizukuInstalled) "Terpasang" else "Tidak terdeteksi")
+        Caption("Integrasi eksekusi lewat Shizuku belum disertakan di versi ini. Senza AI tidak menganggap Shizuku, ADB, dan Root setara; fitur yang butuh root tidak akan berjalan hanya dengan Shizuku.")
+    }
+    GlassCard {
+        Heading("Prinsip keamanan")
+        Body("• Read-only secara default\n• Tidak ada operasi root tersembunyi atau diam-diam\n• AI tidak pernah menjalankan perintah\n• Perintah berbahaya (format, tulis ke partisi, hapus sistem) diblokir\n• Seluruh operasi sensitif dicatat", dim = true)
+    }
+}
+
+// ============================================================================ File Root
+
+private data class FileEntry(val name: String, val isDir: Boolean, val isLink: Boolean, val perm: String, val owner: String, val size: String)
+
+private fun parseLs(out: String): List<FileEntry> = out.lineSequence().mapNotNull { line ->
+    val l = line.trim()
+    if (l.isEmpty() || l.startsWith("total")) return@mapNotNull null
+    val t = l.split(Regex("\\s+"), 8)
+    if (t.size < 8 || t[0].length < 10) return@mapNotNull null
+    val name = t[7].substringBefore(" -> ")
+    if (name == "." || name == "..") return@mapNotNull null
+    FileEntry(name, t[0][0] == 'd', t[0][0] == 'l', t[0], "${t[2]}:${t[3]}", t[4])
+}.sortedWith(compareBy({ !it.isDir && !it.isLink }, { it.name.lowercase() })).toList()
+
+@Composable
+private fun FilesTab(s: ServiceLocator) {
+    val scope = rememberCoroutineScope()
+    var path by remember { mutableStateOf("/system") }
+    var asRoot by remember { mutableStateOf(s.access.isRootVerified) }
+    var entries by remember { mutableStateOf<List<FileEntry>?>(null) }
+    var rawOut by remember { mutableStateOf<String?>(null) }
+    var content by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var pattern by remember { mutableStateOf("") }
+    var found by remember { mutableStateOf<List<String>?>(null) }
+    val rootOk = s.access.isRootVerified
+
+    fun open(p: String) {
+        scope.launch {
+            busy = true; error = null; content = null; found = null
+            try {
+                val a = SafeAction.ListDir(p)
+                val r = s.access.run(a, asRoot)
+                path = a.path
+                val parsed = parseLs(r.output)
+                entries = parsed
+                rawOut = if (parsed.isEmpty()) r.output.take(2000) else null
+                if (!r.ok && parsed.isEmpty()) error = "Tidak dapat membuka direktori (izin ditolak atau tidak ada)."
+            } catch (e: IllegalArgumentException) {
+                error = e.message
+            }
+            busy = false
+        }
+    }
+
+    fun readFile(p: String) {
+        scope.launch {
+            busy = true; error = null
+            try {
+                val a = SafeAction.ReadFile(p)
+                val r = s.access.run(a, asRoot)
+                content = if (r.output.contains('\u0000')) a.path to "(file biner; tidak ditampilkan)"
+                else a.path to r.output.take(60_000).ifEmpty { if (r.ok) "(kosong)" else "Tidak dapat dibaca (izin ditolak?)" }
+            } catch (e: IllegalArgumentException) {
+                error = e.message
+            }
+            busy = false
+        }
+    }
+
+    fun info(p: String) {
+        scope.launch {
+            busy = true; error = null
+            try {
+                val a = SafeAction.Stat(p)
+                content = a.path to s.access.run(a, asRoot).output.take(4000)
+            } catch (e: IllegalArgumentException) {
+                error = e.message
+            }
+            busy = false
+        }
+    }
+
+    GlassCard {
+        Heading("Root File Explorer")
+        Body("Menjelajah, membaca teks, mencari, dan melihat info/izin file. Hanya baca: tidak ada operasi ubah atau hapus.", dim = true)
+        GlassTextField(path, { path = it }, "Path absolut", mono = true)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Chip(if (asRoot && rootOk) "Mode: Root" else "Mode: Normal", asRoot && rootOk) { if (rootOk) asRoot = !asRoot }
+            if (!rootOk) Caption("Root belum diverifikasi")
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GlassButton("Buka", { open(path) }, Modifier.weight(1f), primary = true, enabled = !busy)
+            GlassButton("Naik", { open(path.trimEnd('/').substringBeforeLast('/', "").ifEmpty { "/" }) }, Modifier.weight(1f), enabled = !busy)
+            GlassButton("Info", { info(path) }, Modifier.weight(1f), enabled = !busy)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            GlassTextField(pattern, { pattern = it }, "Cari nama (mis. build.prop, *.rc)", Modifier.weight(1f))
+            GlassButton("Cari", {
+                scope.launch {
+                    busy = true; error = null; content = null
+                    try {
+                        val a = SafeAction.Find(path, pattern)
+                        found = s.access.run(a, asRoot).output.lines().filter { it.isNotBlank() }
+                    } catch (e: IllegalArgumentException) {
+                        error = e.message
+                    }
+                    busy = false
+                }
+            }, enabled = !busy && pattern.isNotBlank())
+        }
+    }
+    if (busy) Spinner("Memproses…")
+    error?.let { ErrorCard(it) }
+
+    content?.let { (title, body) ->
+        GlassCard(strong = true) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Mono(title, Modifier.weight(1f), 11)
+                GlassButton("Tutup", { content = null })
+            }
+            SelectionContainer { Mono(body, size = 11) }
+            if (body.length >= 60_000) Caption("Ditampilkan sebagian.")
+            Caption("Isi file bisa memuat data sensitif. Jangan bagikan tanpa memeriksanya.")
+        }
+    }
+    found?.let { list ->
+        ExpandableCard("Hasil pencarian", true, trailing = "${list.size}") {
+            if (list.isEmpty()) Body("Tidak ada hasil.", dim = true)
+            LimitedList(list, 40) { p -> Mono(p, Modifier.clickableNoRipple { readFile(p) }, 11) }
+        }
+    }
+    entries?.let { list ->
+        ExpandableCard(path, true, trailing = "${list.size} item") {
+            if (list.isEmpty()) Body(rawOut ?: "Kosong.", dim = true)
+            LimitedList(list, 60) { e ->
+                val full = (if (path == "/") "" else path.trimEnd('/')) + "/" + e.name
+                Column(Modifier.fillMaxWidth().clickableNoRipple { if (e.isDir) open(full) else readFile(full) }) {
+                    Mono((if (e.isDir) "▸ " else if (e.isLink) "↪ " else "  ") + e.name, size = 12)
+                    Caption("${e.perm} ${e.owner} ${e.size}")
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================ Shell & ADB
+
+@Composable
+private fun ShellTab(s: ServiceLocator) {
+    AdbInfoCard(s)
+    PackageCard(s)
+    LogcatCard(s)
+    ConsoleCard(s)
+    FastbootCard()
+}
+
+@Composable
+private fun AdbInfoCard(s: ServiceLocator) {
+    val ctx = LocalContext.current
+    val rows by produceState<List<Pair<String, String>>?>(null) {
+        value = withContext(Dispatchers.IO) {
+            fun gInt(k: String) = try {
+                Settings.Global.getInt(ctx.contentResolver, k).let { if (it == 1) "Aktif" else "Nonaktif" }
+            } catch (_: Throwable) {
+                "Tidak tersedia"
+            }
+            val p = Sys.refreshProps()
+            listOf(
+                "Opsi pengembang" to gInt("development_settings_enabled"),
+                "USB debugging" to gInt("adb_enabled"),
+                "Debugging nirkabel" to gInt("adb_wifi_enabled"),
+                "Mode USB (persist.sys.usb.config)" to (p["persist.sys.usb.config"]?.ifBlank { null } ?: "Tidak tersedia"),
+                "Status USB (sys.usb.state)" to (p["sys.usb.state"]?.ifBlank { null } ?: "Tidak tersedia"),
+                "Otorisasi RSA adb (ro.adb.secure)" to (p["ro.adb.secure"]?.ifBlank { null } ?: "Tidak tersedia"),
+                "Port TCP adb" to (p["service.adb.tcp.port"]?.ifBlank { null } ?: "Tidak diatur"),
+                "Debuggable (ro.debuggable)" to (p["ro.debuggable"]?.ifBlank { null } ?: "Tidak tersedia")
+            )
+        }
+    }
+    ExpandableCard("ADB — status & koneksi", true) {
+        rows?.forEach { KeyValue(it.first, it.second) } ?: Spinner("Membaca…")
+        Caption("Senza AI berjalan di perangkat itu sendiri, bukan sebagai klien adb dari komputer. Daftar perangkat adb lain tidak tersedia di sini.")
+    }
+}
+
+@Composable
+private fun PackageCard(s: ServiceLocator) {
+    val ctx = LocalContext.current
+    var q by remember { mutableStateOf("") }
+    var selected by remember { mutableStateOf<List<Pair<String, String>>?>(null) }
+    val apps by produceState<List<Pair<String, String>>?>(null) {
+        value = withContext(Dispatchers.IO) {
+            val pm = ctx.packageManager
+            val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+            pm.queryIntentActivities(i, 0).map { it.loadLabel(pm).toString() to it.activityInfo.packageName }.distinctBy { it.second }.sortedBy { it.first.lowercase() }
+        }
+    }
+
+    fun show(pkg: String) {
+        @Suppress("DEPRECATION")
+        val pi = try {
+            ctx.packageManager.getPackageInfo(pkg, PackageManager.GET_PERMISSIONS)
+        } catch (_: Throwable) {
+            null
+        }
+        selected = if (pi == null) listOf("Paket" to "$pkg tidak terlihat oleh aplikasi ini")
+        else {
+            val ai = pi.applicationInfo
+            val installer = try {
+                if (Build.VERSION.SDK_INT >= 30) ctx.packageManager.getInstallSourceInfo(pkg).installingPackageName else null
+            } catch (_: Throwable) {
+                null
+            }
+            listOf(
+                "Paket" to pkg,
+                "Versi" to "${pi.versionName ?: "?"} (${pi.longVersionCode})",
+                "Min / Target SDK" to "${ai?.minSdkVersion ?: "?"} / ${ai?.targetSdkVersion ?: "?"}",
+                "UID" to (ai?.uid?.toString() ?: "?"),
+                "Terpasang" to pi.firstInstallTime.formatTime(),
+                "Diperbarui" to pi.lastUpdateTime.formatTime(),
+                "Installer" to (installer ?: "Tidak diketahui"),
+                "Lokasi APK" to (ai?.sourceDir ?: "?"),
+                "Izin diminta" to (pi.requestedPermissions?.size ?: 0).toString(),
+                "Sistem" to if (ai != null && (ai.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0) "Ya" else "Tidak"
+            )
+        }
+    }
+
+    ExpandableCard("Informasi aplikasi", false) {
+        Caption("Menampilkan aplikasi yang memiliki ikon peluncur. Android membatasi visibilitas paket lain (package visibility).")
+        GlassTextField(q, { q = it }, "Cari nama atau paket")
+        val list = apps?.filter { q.isBlank() || it.first.contains(q, true) || it.second.contains(q, true) }
+        if (list == null) Spinner("Memuat…") else LimitedList(list, 15) { (label, pkg) ->
+            Column(Modifier.fillMaxWidth().clickableNoRipple { show(pkg) }) {
+                Body(label)
+                Caption(pkg)
+            }
+        }
+        selected?.let { sel ->
+            GlassDivider()
+            sel.forEach { KeyValue(it.first, it.second) }
+        }
+    }
+}
+
+@Composable
+private fun LogcatCard(s: ServiceLocator) {
+    val scope = rememberCoroutineScope()
+    var text by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var filter by remember { mutableStateOf("") }
+    var level by remember { mutableStateOf(0) }
+    val levels = listOf("Semua", "W+", "E+")
+    val rootOk = s.access.isRootVerified
+    ExpandableCard("Logcat viewer", false) {
+        Caption(if (rootOk) "Mode root: log sistem penuh." else "Normal Access: Android hanya memberi log milik aplikasi ini. Untuk log sistem, verifikasi root atau ekspor log lewat adb dari komputer.")
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GlassButton(if (busy) "Mengambil…" else "Ambil logcat", {
+                scope.launch {
+                    busy = true
+                    text = s.access.run(SafeAction.Logcat, rootOk).output
+                    busy = false
+                }
+            }, primary = true, enabled = !busy)
+            GlassButton("Kirim ke AI", { text?.let { s.session.lastLog = it.takeLast(60_000) } }, enabled = text != null)
+        }
+        ChipRow(levels, level) { level = it }
+        GlassTextField(filter, { filter = it }, "Filter teks")
+        text?.let { t ->
+            val lines = remember(t, filter, level) {
+                t.lines().filter { l ->
+                    (filter.isBlank() || l.contains(filter, true)) && when (level) {
+                        1 -> Regex("""\s[WEF]\s""").containsMatchIn(l)
+                        2 -> Regex("""\s[EF]\s""").containsMatchIn(l)
+                        else -> true
+                    }
+                }.takeLast(400)
+            }
+            Caption("${lines.size} baris (maks 400 terakhir)")
+            SelectionContainer { Mono(lines.joinToString("\n").ifBlank { "(kosong)" }, size = 10) }
+            if (s.session.lastLog != null) Caption("Log tersimpan sebagai lampiran opsional di tab AI (tidak dikirim otomatis).")
+        }
+    }
+}
+
+@Composable
+private fun ConsoleCard(s: ServiceLocator) {
+    val scope = rememberCoroutineScope()
+    var cmd by remember { mutableStateOf("") }
+    var asRoot by remember { mutableStateOf(false) }
+    var output by remember { mutableStateOf<String?>(null) }
+    var confirm by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
+    val rootOk = s.access.isRootVerified
+
+    if (confirm) ConfirmDialog(
+        title = if (asRoot) "Jalankan sebagai ROOT?" else "Jalankan perintah?",
+        message = "Perintah:\n\n$cmd\n\nPerintah dijalankan persis seperti yang kamu ketik. Senza AI tidak memeriksa efek sampingnya selain daftar blokir dasar. Pastikan kamu memahami risikonya dan punya backup bila menyentuh sistem.",
+        confirmText = "Jalankan",
+        danger = asRoot,
+        onConfirm = {
+            confirm = false
+            scope.launch {
+                busy = true
+                val r = s.access.runUserCommand(cmd, asRoot)
+                output = "exit=${r.exitCode}${if (r.timedOut) " (timeout)" else ""}\n" + r.output.take(30_000)
+                busy = false
+            }
+        },
+        onDismiss = { confirm = false }
+    )
+
+    ExpandableCard("Shell console", false) {
+        Caption("Hanya menjalankan perintah yang kamu ketik sendiri dan konfirmasi. Teks dari AI tidak pernah dijalankan otomatis. Perintah destruktif umum (format, tulis ke partisi blok, hapus /system, dll.) diblokir.")
+        GlassTextField(cmd, { cmd = it }, "Perintah", singleLine = false, mono = true, minLines = 2)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Chip(if (asRoot) "Sebagai root" else "Sebagai aplikasi", asRoot) { if (rootOk) asRoot = !asRoot }
+            if (!rootOk) Caption("Root belum diverifikasi")
+        }
+        GlassButton(if (busy) "Berjalan…" else "Jalankan…", { confirm = true }, primary = true, enabled = cmd.isNotBlank() && !busy, danger = asRoot)
+        output?.let { SelectionContainer { Mono(it, size = 11) } }
+    }
+}
+
+@Composable
+private fun FastbootCard() {
+    val rows by produceState<List<Pair<String, String>>?>(null) {
+        value = withContext(Dispatchers.IO) {
+            val p = Sys.props()
+            fun v(k: String) = p[k]?.ifBlank { null } ?: "Tidak tersedia"
+            listOf(
+                "Bootloader" to Build.BOOTLOADER,
+                "Device / codename" to Build.DEVICE,
+                "Slot aktif" to v("ro.boot.slot_suffix"),
+                "Bootloader terkunci (flash.locked)" to v("ro.boot.flash.locked"),
+                "Status vbmeta" to v("ro.boot.vbmeta.device_state"),
+                "Verified boot" to v("ro.boot.verifiedbootstate"),
+                "OEM unlock diizinkan" to v("sys.oem_unlock_allowed"),
+                "Dynamic partitions" to v("ro.boot.dynamic_partitions")
+            )
+        }
+    }
+    ExpandableCard("Fastboot & bootloader (informasi)", false) {
+        rows?.forEach { KeyValue(it.first, it.second) } ?: Spinner("Membaca…")
+        Caption("Kontrol fastboot/bootloader (flash, unlock, boot image) dijalankan dari komputer atau aplikasi pendamping dan tidak dijanjikan berjalan langsung di semua perangkat. Senza AI hanya menampilkan informasinya.")
+    }
+}
+
+// ============================================================================ Monitor
+
+@Composable
+private fun MonitorTab(s: ServiceLocator) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var running by remember { mutableStateOf(false) }
+    val samples = remember { mutableStateListOf<PerfSample>() }
+    var procs by remember { mutableStateOf<Pair<List<ProcInfo>, String>?>(null) }
+    var history by remember { mutableStateOf<List<PerfSample>>(emptyList()) }
+    var confirmClear by remember { mutableStateOf(false) }
+    val rootOk = s.access.isRootVerified
+
+    val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
+        if (uri != null) scope.launch(Dispatchers.IO) {
+            try {
+                val f = s.history.exportFile()
+                if (f != null) ctx.contentResolver.openOutputStream(uri)?.use { out -> f.inputStream().use { it.copyTo(out) } }
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    LaunchedEffect(Unit) { history = withContext(Dispatchers.IO) { s.history.load() } }
+
+    LaunchedEffect(running) {
+        if (!running) return@LaunchedEffect
+        val pending = mutableListOf<PerfSample>()
+        try {
+            s.monitor.samples(2000).collect { smp ->
+                samples.add(smp)
+                if (samples.size > 90) samples.removeAt(0)
+                pending.add(smp)
+                if (pending.size >= 15) {
+                    s.history.append(pending.toList())
+                    pending.clear()
+                }
+            }
+        } finally {
+            if (pending.isNotEmpty()) s.history.append(pending.toList())
+        }
+    }
+
+    if (confirmClear) ConfirmDialog(
+        title = "Hapus riwayat?", message = "Seluruh riwayat sesi monitoring akan dihapus.", confirmText = "Hapus", danger = true,
+        onConfirm = { s.history.clear(); history = emptyList(); confirmClear = false },
+        onDismiss = { confirmClear = false }
+    )
+
+    val g = LocalGlass.current
+    GlassCard(strong = true) {
+        Heading("Performance Monitor")
+        Body("Pengambilan data hanya berjalan selama monitor dinyalakan dan layar ini terbuka (tidak ada layanan latar belakang) agar hemat baterai.", dim = true)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GlassButton(if (running) "Hentikan" else "Mulai monitor", { running = !running }, primary = true, danger = running)
+            GlassButton("Muat riwayat", { scope.launch { history = withContext(Dispatchers.IO) { s.history.load() } } })
+        }
+        KeyValue("Uptime sistem", s.monitor.uptimeMs().formatDuration())
+        KeyValue("Uptime aktif (tanpa deep sleep)", s.monitor.uptimeAwakeMs().formatDuration())
+    }
+
+    if (samples.isNotEmpty()) {
+        val list = samples.toList()
+        GlassCard {
+            Heading("Penggunaan (sesi berjalan)")
+            LineChart(
+                listOf("CPU" to list.map { it.cpu }, "RAM" to list.map { it.ramPercent }),
+                listOf(g.accent2, g.accent), minY = 0f, maxY = 100f, unit = "%"
+            )
+            if (list.any { it.cpuEstimate }) Caption("CPU diestimasi dari frekuensi core karena /proc/stat tidak dapat dibaca.")
+        }
+        GlassCard {
+            Heading("Suhu")
+            LineChart(
+                listOf("Baterai" to list.map { it.batteryTemp }, "Perangkat" to list.map { it.deviceTemp }),
+                listOf(g.warn, g.bad), unit = "°"
+            )
+        }
+        GlassCard {
+            Heading("Baterai & beban")
+            LineChart(listOf("Baterai" to list.map { it.batteryPercent.toFloat() }), listOf(g.good), minY = 0f, maxY = 100f, unit = "%")
+            list.lastOrNull()?.load1?.let { KeyValue("Load average (1 mnt)", it.f1()) }
+        }
+    }
+
+    GlassCard {
+        Heading("Proses")
+        Caption(if (rootOk) "Mode root dapat melihat seluruh proses." else "Normal Access hanya melihat proses yang terlihat oleh aplikasi ini.")
+        GlassButton("Muat daftar proses", { scope.launch { procs = s.monitor.processes(rootOk) } })
+        procs?.let { (list, note) ->
+            Caption(note)
+            if (list.isEmpty()) Body("Tidak ada data proses yang dapat dibaca.", dim = true)
+            LimitedList(list, 25) { p -> KeyValue("${p.name} (${p.pid})", "${(p.rssKb * 1024).formatBytes()} · ${p.user}") }
+        }
+    }
+
+    if (history.isNotEmpty()) GlassCard {
+        Heading("Riwayat")
+        Caption(s.history.statsText(history))
+        LineChart(
+            listOf("CPU" to history.takeLast(300).map { it.cpu }, "RAM" to history.takeLast(300).map { it.ramPercent }),
+            listOf(g.accent2, g.accent), minY = 0f, maxY = 100f, unit = "%"
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GlassButton("Ekspor CSV", { export.launch("senza-performance.csv") }, Modifier.weight(1f))
+            GlassButton("Hapus", { confirmClear = true }, Modifier.weight(1f), danger = true)
+        }
+    }
+}
+
+// ============================================================================ Log
+
+@Composable
+private fun LogTab(s: ServiceLocator) {
+    val ctx = LocalContext.current
+    val entries by s.operationLog.entries.collectAsState()
+    var confirm by remember { mutableStateOf(false) }
+    if (confirm) ConfirmDialog(
+        "Hapus log operasi?", "Seluruh catatan operasi akan dihapus.", "Hapus", true,
+        { s.operationLog.clear(); confirm = false }, { confirm = false }
+    )
+    GlassCard {
+        Heading("Log operasi")
+        Body("Setiap aksi root, shell, dan pemanggilan AI dicatat di sini (hanya di perangkat ini). Isi file dan jawaban AI tidak dicatat.", dim = true)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GlassButton("Bagikan", {
+                val send = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_TEXT, s.operationLog.asText().ifBlank { "(kosong)" })
+                }
+                ctx.startActivity(Intent.createChooser(send, "Bagikan log").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            }, Modifier.weight(1f), enabled = entries.isNotEmpty())
+            GlassButton("Hapus", { confirm = true }, Modifier.weight(1f), danger = true, enabled = entries.isNotEmpty())
+        }
+    }
+    if (entries.isEmpty()) Body("Belum ada operasi tercatat.", dim = true)
+    LimitedList(entries.asReversed(), 30) { e ->
+        GlassCard(padding = 12.dp) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                StatusPill(e.mode, if (e.mode == "ROOT") LocalGlass.current.warn else LocalGlass.current.accent2)
+                Caption(e.time.formatTime())
+            }
+            Mono(e.action, size = 11)
+            Caption("Hasil: ${e.result}")
+        }
+    }
+}
