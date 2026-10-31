@@ -31,6 +31,7 @@ class RootEditor(private val ctx: Context, private val access: AccessManager, pr
         val rebooting: Boolean,
         val overlaid: List<String> = emptyList()
     )
+    data class PartInfo(val path: String, val fs: String, val readOnly: Boolean, val mountPoint: String, val overlayOk: Boolean)
     private data class MountInfo(val dev: String, val mp: String, val fs: String, val opts: List<String>)
 
     companion object {
@@ -162,18 +163,24 @@ class RootEditor(private val ctx: Context, private val access: AccessManager, pr
         mode: ApplyMode, overlaid: MutableList<String>
     ): String? {
         val path = PathGuard.validate(p.path)
+        // Ikuti symlink (mis. /system/tr_product -> /tr_product) agar mount point & overlay memakai path sebenarnya.
+        val real: String = (try {
+            access.runRootEdit("readlink -f -- '$path'", "resolve path").output.trim().takeIf { it.startsWith("/") }?.let { PathGuard.validate(it) }
+        } catch (_: IllegalArgumentException) {
+            null
+        }) ?: path
         val orig = access.runRootEdit("cat -- '$path'", "baca file asli")
         if (!orig.ok) return "Tidak dapat membaca file asli."
         val backup = File(backupDir, path.replace(Regex("[^A-Za-z0-9._-]"), "_") + "." + System.currentTimeMillis() + ".bak")
         backup.writeText(orig.output)
 
         val tmp = File(tmpDir, "n$idx.tmp").apply { writeText(p.content) }
-        val mt = mounts.filter { it.mp == "/" || path.startsWith(it.mp.trimEnd('/') + "/") }.maxByOrNull { it.mp.length }
+        val mt = mounts.filter { it.mp == "/" || real.startsWith(it.mp.trimEnd('/') + "/") }.maxByOrNull { it.mp.length }
         val roMount = mt != null && mt.opts.contains("ro")
         val permanentRo = mt != null && (mt.fs == "erofs" || mt.fs == "squashfs")
 
         if (mode == ApplyMode.OVERLAY || (mode == ApplyMode.AUTO && permanentRo)) {
-            return writeOverlay(path, tmp, tmpDir, overlaid)
+            return writeOverlay(real, tmp, tmpDir, overlaid)
         }
 
         var remounted = false
@@ -184,7 +191,7 @@ class RootEditor(private val ctx: Context, private val access: AccessManager, pr
             var r = access.runRootEdit("mount -o rw,remount '${mt!!.mp}'", "remount rw")
             if (!r.ok) r = access.runRootEdit("mount -o rw,remount '${mt.dev}' '${mt.mp}'", "remount rw (dev)")
             if (!r.ok) {
-                if (mode == ApplyMode.AUTO) return writeOverlay(path, tmp, tmpDir, overlaid)
+                if (mode == ApplyMode.AUTO) return writeOverlay(real, tmp, tmpDir, overlaid)
                 return "Gagal remount rw ${mt.mp}: ${r.output.trim().take(120)}"
             }
             remounted = true
@@ -205,7 +212,8 @@ class RootEditor(private val ctx: Context, private val access: AccessManager, pr
 
     /** Tulis file ke module systemless; berlaku setelah reboot tanpa menyentuh partisi asli. */
     private suspend fun writeOverlay(path: String, tmp: File, tmpDir: File, overlaid: MutableList<String>): String? {
-        val rel = overlayRel(path) ?: return "Path ini tidak bisa di-overlay (hanya /system, /vendor, /product, /system_ext, /odm)."
+        val rel = overlayRel(path) ?: return "Overlay Magisk hanya mendukung /system (termasuk /system/tr_*), /vendor, /product, /system_ext, /odm. " +
+            "Partisi top-level seperti $path tidak bisa di-overlay; gunakan mode Langsung (bila partisi rw) atau pindahkan partisinya ke /system/tr_x."
         if (!access.runRootEdit("test -d /data/adb/modules", "cek folder module").ok) {
             return "Folder /data/adb/modules tidak ada: butuh Magisk/KernelSU/APatch untuk mode overlay."
         }
@@ -237,5 +245,27 @@ class RootEditor(private val ctx: Context, private val access: AccessManager, pr
         val p = PathGuard.validate(path)
         val rel = overlayRel(p) ?: return false
         return access.runRootEdit("rm -f '$MODULE_DIR/$rel'", "hapus overlay").ok
+    }
+
+    /** Pindai partisi umum + Transsion (tr_*), baik top-level (/tr_product) maupun di dalam system (/system/tr_product). */
+    suspend fun listPartitions(asRoot: Boolean): List<PartInfo> {
+        val base = listOf("system", "product", "system_ext", "vendor", "odm", "vendor_dlkm", "odm_dlkm", "system_dlkm")
+        val tr = listOf("tr_product", "tr_region", "tr_manifest", "tr_system", "tr_overlayfs", "tr_preload", "tr_company", "tr_carrier")
+        val mountsText = access.run(SafeAction.Mounts, asRoot).output
+        val mounts = parseMounts(mountsText)
+        val dynamicTr = mounts.map { it.mp }.filter { Regex("^/(system/)?tr_[A-Za-z0-9_]+$").matches(it) }
+        val candidates = (base.map { "/$it" } + tr.map { "/$it" } + tr.map { "/system/$it" } +
+            base.drop(1).map { "/system/$it" } + dynamicTr).distinct()
+        val found = access.existingDirs(candidates, asRoot)
+        return found.map { path ->
+            val mt = mounts.filter { it.mp == "/" || path == it.mp || path.startsWith(it.mp.trimEnd('/') + "/") }.maxByOrNull { it.mp.length }
+            PartInfo(
+                path = path,
+                fs = mt?.fs ?: "?",
+                readOnly = mt?.opts?.contains("ro") == true,
+                mountPoint = mt?.mp ?: "?",
+                overlayOk = overlayRel("$path/x") != null
+            )
+        }
     }
 }

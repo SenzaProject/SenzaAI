@@ -32,7 +32,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-private val TABS = listOf("Akses", "File Root", "Shell & ADB", "Monitor", "Log")
+private val TABS = listOf("Akses", "File Root", "Shell & ADB", "Monitor", "Performa", "Log")
 
 @Composable
 fun ToolsScreen(s: ServiceLocator) {
@@ -44,6 +44,7 @@ fun ToolsScreen(s: ServiceLocator) {
             1 -> FilesTab(s)
             2 -> ShellTab(s)
             3 -> MonitorTab(s)
+            4 -> PerfTab(s)
             else -> LogTab(s)
         }
     }
@@ -110,6 +111,9 @@ private fun AccessTab(s: ServiceLocator) {
 
 private val QUICK_FILES = listOf(
     "/system/build.prop", "/system_ext/build.prop", "/vendor/build.prop", "/product/build.prop", "/odm/build.prop",
+    "/tr_product/etc/build.prop", "/system/tr_product/etc/build.prop", "/tr_region/etc/build.prop", "/system/tr_region/etc/build.prop",
+    "/tr_system/etc/build.prop", "/system/tr_system/etc/build.prop", "/tr_preload/etc/build.prop", "/system/tr_preload/etc/build.prop",
+    "/tr_manifest/etc/build.prop", "/system/tr_manifest/etc/build.prop",
     "/system/etc/permissions/platform.xml", "/vendor/etc/media_codecs.xml", "/vendor/etc/media_codecs_performance.xml",
     "/vendor/etc/audio_policy_configuration.xml", "/system/etc/init/hw/init.rc"
 )
@@ -149,18 +153,28 @@ private fun FilesTab(s: ServiceLocator) {
     var applyMsg by remember { mutableStateOf<String?>(null) }
     var modeIdx by remember { mutableStateOf(0) }
     var quickFound by remember { mutableStateOf<List<String>?>(null) }
+    var parts by remember { mutableStateOf<List<RootEditor.PartInfo>?>(null) }
     var overlays by remember { mutableStateOf<List<String>?>(null) }
     val modeNames = listOf("Otomatis", "Langsung", "Overlay Magisk")
     val modes = listOf(ApplyMode.AUTO, ApplyMode.DIRECT, ApplyMode.OVERLAY)
 
-    fun open(p: String) {
+    fun open(p: String, fallbackRead: Boolean = false) {
         scope.launch {
             busy = true; error = null; content = null; found = null
             try {
                 val a = SafeAction.ListDir(p)
                 val r = s.access.run(a, asRoot)
-                path = a.path
                 val parsed = parseLs(r.output)
+                if (fallbackRead && !r.ok && parsed.isEmpty()) {
+                    // symlink ke file, bukan direktori: tampilkan isinya
+                    val fa = SafeAction.ReadFile(p)
+                    val fr = s.access.run(fa, asRoot)
+                    contentIsFile = true
+                    content = fa.path to fr.output.take(60_000).ifEmpty { "Tidak dapat dibaca (izin ditolak?)" }
+                    busy = false
+                    return@launch
+                }
+                path = a.path
                 entries = parsed
                 rawOut = if (parsed.isEmpty()) r.output.take(2000) else null
                 if (!r.ok && parsed.isEmpty()) error = "Tidak dapat membuka direktori (izin ditolak atau tidak ada)."
@@ -245,6 +259,28 @@ private fun FilesTab(s: ServiceLocator) {
             }, enabled = !busy && pattern.isNotBlank())
         }
     }
+    GlassCard {
+        Heading("Partisi")
+        Body("Menampilkan partisi di perangkat, termasuk Transsion (tr_product, tr_region, tr_manifest, tr_system, tr_overlayfs, tr_preload) baik di root maupun di dalam /system (mis. /system/tr_product).", dim = true)
+        GlassButton("Pindai partisi", {
+            scope.launch {
+                busy = true
+                parts = editor.listPartitions(asRoot)
+                busy = false
+            }
+        }, Modifier.fillMaxWidth(), primary = true, enabled = !busy)
+        parts?.let { list ->
+            if (list.isEmpty()) Body("Tidak ada partisi terbaca.", dim = true)
+            list.forEach { pi ->
+                Column(Modifier.fillMaxWidth().clickableNoRipple { open(pi.path, true) }) {
+                    Mono(pi.path, size = 12)
+                    Caption("${pi.fs} · ${if (pi.readOnly) "hanya-baca" else "rw"} · mount ${pi.mountPoint}${if (pi.overlayOk) "" else " · tanpa overlay"}")
+                }
+            }
+            Caption("Tap partisi untuk membuka isinya, mis. tr_product/etc/build.prop. Overlay Magisk hanya untuk /system (termasuk /system/tr_*), vendor, product, system_ext, odm.")
+        }
+    }
+
     GlassCard {
         Heading("Edit cepat")
         Body("Pintasan build.prop, XML, dan init.rc umum. Tekan Pindai untuk melihat file yang ada di perangkat ini.", dim = true)
@@ -389,7 +425,7 @@ private fun FilesTab(s: ServiceLocator) {
             if (list.isEmpty()) Body(rawOut ?: "Kosong.", dim = true)
             LimitedList(list, 60) { e ->
                 val full = (if (path == "/") "" else path.trimEnd('/')) + "/" + e.name
-                Column(Modifier.fillMaxWidth().clickableNoRipple { if (e.isDir) open(full) else readFile(full) }) {
+                Column(Modifier.fillMaxWidth().clickableNoRipple { if (e.isDir) open(full) else if (e.isLink) open(full, true) else readFile(full) }) {
                     Mono((if (e.isDir) "▸ " else if (e.isLink) "↪ " else "  ") + e.name, size = 12)
                     Caption("${e.perm} ${e.owner} ${e.size}")
                 }

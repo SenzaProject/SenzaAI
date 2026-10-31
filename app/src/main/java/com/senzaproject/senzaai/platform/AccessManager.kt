@@ -144,4 +144,14 @@ class AccessManager(private val ctx: Context, private val log: OperationLog) {
         log.add(if (useRoot) "ROOT" else "NORMAL", "pindai pintasan edit (${valid.size} path)", if (r.ok || r.output.isNotBlank()) "ok" else "exit=${r.exitCode}")
         r.output.lines().map { it.trim() }.filter { it in valid }
     }
+
+    /** Seperti [existingFiles] tetapi untuk direktori (mengikuti symlink). */
+    suspend fun existingDirs(paths: List<String>, asRoot: Boolean): List<String> = withContext(Dispatchers.IO) {
+        val valid = paths.map { com.senzaproject.senzaai.platform.root.PathGuard.validate(it) }
+        val cmd = "for f in " + valid.joinToString(" ") { "'$it'" } + "; do [ -d \"\$f\" ] && echo \"\$f\"; done"
+        val useRoot = asRoot && rootVerified
+        val r = if (useRoot) Sys.execute(listOf("su", "-c", cmd), 15_000) else Sys.execute(listOf("sh", "-c", cmd), 15_000)
+        log.add(if (useRoot) "ROOT" else "NORMAL", "pindai partisi (${valid.size} path)", if (r.ok || r.output.isNotBlank()) "ok" else "exit=${r.exitCode}")
+        r.output.lines().map { it.trim() }.filter { it in valid }
+    }
 }
