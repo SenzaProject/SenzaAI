@@ -220,7 +220,7 @@ class ApkAnalyzer(private val ctx: Context) {
         val vVersionCode: Long = pi.longVersionCode
         val vMinSdk: Int = ai.minSdkVersion
         val vTargetSdk: Int = ai.targetSdkVersion
-        val vCompileSdkRaw: Int = pi.compileSdkVersion
+        val vCompileSdkRaw: Int = 0
         val vCompileSdk: Int? = if (vCompileSdkRaw > 0) vCompileSdkRaw else null
         val vIcon: Bitmap? = icon
         val vAbis: List<String> = libs.map { it.abi }.distinct()
