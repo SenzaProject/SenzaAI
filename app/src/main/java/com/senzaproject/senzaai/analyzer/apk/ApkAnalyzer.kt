@@ -211,40 +211,37 @@ class ApkAnalyzer(private val ctx: Context) {
 
         val compat = compatibility(ai, libs, pi.packageName)
 
-        // Salin variabel yang diubah di dalam lambda ke val agar tipenya pasti.
-        val resFilesF: Int = resFiles
-        val arscF: Long = arsc
-        val assetsF: Int = assets
-        val v1F: Boolean = v1
-        val structureF: List<Triple<String, Long, Int>> =
+        // Setiap argumen dihitung ke variabel bertipe eksplisit agar kesalahan (jika ada) terlokalisasi.
+        val vFileName: String = displayName
+        val vSize: Long = file.length()
+        val vAppName: String = label
+        val vPackage: String = pi.packageName
+        val vVersionName: String? = pi.versionName
+        val vVersionCode: Long = pi.longVersionCode
+        val vMinSdk: Int = ai.minSdkVersion
+        val vTargetSdk: Int = ai.targetSdkVersion
+        val vCompileSdkRaw: Int = pi.compileSdkVersion
+        val vCompileSdk: Int? = if (vCompileSdkRaw > 0) vCompileSdkRaw else null
+        val vIcon: Bitmap? = icon
+        val vAbis: List<String> = libs.map { it.abi }.distinct()
+        val vLibs: List<NativeLib> = libs.toList()
+        val vDex: List<DexInfo> = dex.toList()
+        val vComponents: List<ApkComponent> = components.toList()
+        val vPerms: List<ApkPermission> = perms.toList()
+        val vCerts: List<CertInfo> = certs.toList()
+        val vV1: Boolean = v1
+        val vResFiles: Int = resFiles
+        val vArsc: Long = arsc
+        val vAssets: Int = assets
+        val vStructure: List<Triple<String, Long, Int>> =
             groups.entries.sortedByDescending { it.value.first }.map { Triple(it.key, it.value.first, it.value.second) }
-        val notesF: List<ApkNote> = notes.toList()
-        val compatF: List<CompatFinding> = compat.toList()
+        val vNotes: List<ApkNote> = notes.toList()
+        val vCompat: List<CompatFinding> = compat.toList()
 
         return ApkReport(
-            fileName = displayName,
-            sizeBytes = file.length(),
-            appName = label,
-            packageName = pi.packageName,
-            versionName = pi.versionName,
-            versionCode = pi.longVersionCode,
-            minSdk = ai.minSdkVersion,
-            targetSdk = ai.targetSdkVersion,
-            compileSdk = pi.compileSdkVersion.takeIf { it > 0 },
-            icon = icon,
-            abis = libs.map { it.abi }.distinct(),
-            nativeLibs = libs,
-            dex = dex,
-            components = components,
-            permissions = perms,
-            certs = certs,
-            hasV1Signature = v1F,
-            resourceFiles = resFilesF,
-            arscBytes = arscF,
-            assetFiles = assetsF,
-            structure = structureF,
-            notes = notesF,
-            compat = compatF
+            vFileName, vSize, vAppName, vPackage, vVersionName, vVersionCode, vMinSdk, vTargetSdk, vCompileSdk,
+            vIcon, vAbis, vLibs, vDex, vComponents, vPerms, vCerts, vV1, vResFiles, vArsc, vAssets, vStructure,
+            vNotes, vCompat
         )
     }
 
